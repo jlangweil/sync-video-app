@@ -38,9 +38,15 @@ const uploadsDir = path.join(__dirname, 'uploads');
   }
 });
 
-// Helper function to generate unique IDs
-function generateUniqueId() {
-  return crypto.randomBytes(8).toString('hex');
+// Helper function to generate shorter unique IDs
+function generateUniqueId(length = 8) {
+  // Use a combination of random characters for IDs
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let result = '';
+  for (let i = 0; i < length; i++) {
+    result += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return result;
 }
 
 // Function to ensure the URL has the correct format
@@ -61,11 +67,14 @@ function fixVideoUrl(url) {
   return url;
 }
 
+// Track rooms and their video states
+const rooms = {};
+
 // Initialize a room for a new video
 app.post('/create-room', (req, res) => {
-  // Generate a unique video ID and roomId
+  // Generate a unique video ID and shorter roomId
   const videoId = generateUniqueId();
-  const roomId = Date.now().toString(36) + Math.random().toString(36).substr(2);
+  const roomId = generateUniqueId(8); // 8 character room ID
   
   // Initialize the room with placeholder video URL (will be updated when chunks are received)
   rooms[roomId] = {
@@ -192,6 +201,98 @@ app.post('/upload-chunk', (req, res) => {
   });
 });
 
+// Set up storage for uploaded videos
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const uploadDir = path.join(__dirname, 'uploads');
+    if (!fs.existsSync(uploadDir)) {
+      try {
+        fs.mkdirSync(uploadDir, { recursive: true });
+        console.log('Created uploads directory:', uploadDir);
+      } catch (err) {
+        console.error('Error creating uploads directory:', err);
+      }
+    }
+    cb(null, uploadDir);
+  },
+  filename: (req, file, cb) => {
+    cb(null, Date.now() + path.extname(file.originalname));
+  }
+});
+
+// Set up a simpler upload middleware
+const upload = multer({
+  storage: storage,
+  limits: { fileSize: 5000000000 }, // 5GB limit
+  fileFilter: (req, file, cb) => {
+    // Accept all video files
+    const filetypes = /mp4|webm|mov|avi|mkv|m4v|mp2|mpe|mpg|mpeg|mpv/;
+    const extname = filetypes.test(path.extname(file.originalname).toLowerCase());
+    
+    // Less strict mimetype check
+    const videoMimeType = file.mimetype.startsWith('video/');
+    
+    if (extname || videoMimeType) {
+      return cb(null, true);
+    }
+    cb(new Error("Error: Videos Only! File type: " + file.mimetype));
+  }
+}).single('video');
+
+// Serve static files
+app.use(express.static(path.join(__dirname, 'public')));
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
+// Handle video upload with improved error handling
+app.post('/upload', (req, res) => {
+  console.log('Received upload request');
+  
+  upload(req, res, function(err) {
+    if (err instanceof multer.MulterError) {
+      // A Multer error occurred when uploading
+      console.error('Multer error:', err);
+      return res.status(500).json({ error: `Upload error: ${err.message}` });
+    } else if (err) {
+      // An unknown error occurred
+      console.error('Unknown error:', err);
+      return res.status(500).json({ error: `Unknown error: ${err.message}` });
+    }
+    
+    // Check if file exists
+    if (!req.file) {
+      console.error('No file received in the request');
+      return res.status(400).json({ error: 'No file was selected or the file was empty' });
+    }
+    
+    console.log('File details:', req.file);
+    
+    // Everything went fine
+    const roomId = generateUniqueId(8); // Short room ID (8 chars)
+    const videoUrl = fixVideoUrl(`/uploads/${req.file.filename}`);
+    
+    // Initialize the room with the video URL
+    rooms[roomId] = {
+      videoState: {
+        isPlaying: false,
+        currentTime: 0,
+        lastUpdate: Date.now()
+      },
+      users: [],
+      videoUrl: videoUrl,
+      hostId: null,
+      uploadComplete: true
+    };
+    
+    console.log('Created room:', roomId, 'with video:', videoUrl);
+    
+    return res.status(200).json({ 
+      success: true, 
+      videoUrl: videoUrl,
+      roomId: roomId
+    });
+  });
+});
+
 // Serve videos with support for range requests (partial content)
 app.get('/videos/:videoId', (req, res) => {
   const videoPath = path.join(uploadsDir, req.params.videoId);
@@ -235,12 +336,59 @@ app.get('/videos/:videoId', (req, res) => {
   }
 });
 
-// Serve static files
-app.use(express.static(path.join(__dirname, 'public')));
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
-
-// Track rooms and their video states
-const rooms = {};
+// Add a new route for video deletion
+app.delete('/videos/:videoId', (req, res) => {
+  const videoId = req.params.videoId;
+  const roomId = req.query.roomId;
+  
+  // Security check - only allow deletion if requested by room host
+  if (!roomId || !rooms[roomId]) {
+    return res.status(404).json({ error: 'Room not found' });
+  }
+  
+  const socketId = req.query.socketId;
+  if (socketId !== rooms[roomId].hostId) {
+    return res.status(403).json({ error: 'Only the host can delete videos' });
+  }
+  
+  const videoPath = path.join(uploadsDir, `${videoId}.mp4`);
+  
+  if (!fs.existsSync(videoPath)) {
+    return res.status(404).json({ error: 'Video not found' });
+  }
+  
+  try {
+    // Delete the video file
+    fs.unlinkSync(videoPath);
+    
+    // Also clean up any remaining chunks
+    const chunkDir = path.join(chunksDir, videoId);
+    if (fs.existsSync(chunkDir)) {
+      // Delete all files in the chunk directory
+      const files = fs.readdirSync(chunkDir);
+      files.forEach(file => {
+        fs.unlinkSync(path.join(chunkDir, file));
+      });
+      
+      // Delete the directory
+      fs.rmdirSync(chunkDir);
+    }
+    
+    // Update room to indicate video is deleted
+    if (rooms[roomId]) {
+      rooms[roomId].videoUrl = null;
+      rooms[roomId].videoDeleted = true;
+      
+      // Notify all users in the room
+      io.to(roomId).emit('videoDeleted');
+    }
+    
+    return res.status(200).json({ success: true, message: 'Video deleted successfully' });
+  } catch (error) {
+    console.error('Error deleting video:', error);
+    return res.status(500).json({ error: 'Error deleting video' });
+  }
+});
 
 // Socket.io connection handling
 io.on('connection', (socket) => {
@@ -314,7 +462,7 @@ io.on('connection', (socket) => {
         const currentState = rooms[roomId].videoState;
         const isSignificantChange = 
           currentState.isPlaying !== videoState.isPlaying || 
-          Math.abs(currentState.currentTime - videoState.currentTime) > 1.0;
+          Math.abs(currentState.currentTime - videoState.currentTime) > 0.5;
         
         if (isSignificantChange) {
           console.log(`Host (${socket.id}) updated video state:`, videoState);
@@ -359,7 +507,7 @@ io.on('connection', (socket) => {
     }
   });
   
-  // Handle explicit video sharing from host
+  // Handle explicit video sharing from host (with more reliable delivery)
   socket.on('shareVideo', ({ roomId, videoUrl }) => {
     console.log(`Host is explicitly sharing video in room ${roomId}:`, videoUrl);
     
@@ -374,6 +522,49 @@ io.on('connection', (socket) => {
       } else {
         console.log(`Rejected video sharing from non-host user: ${socket.id}`);
       }
+    }
+  });
+  
+  // Handle video deletion requests
+  socket.on('deleteVideo', ({ roomId, videoId }) => {
+    console.log(`Request to delete video ${videoId} from room ${roomId}`);
+    
+    // Check if user is the host
+    if (!roomId || !rooms[roomId] || socket.id !== rooms[roomId].hostId) {
+      console.log(`Rejected video deletion from non-host user: ${socket.id}`);
+      return;
+    }
+    
+    const videoPath = path.join(uploadsDir, `${videoId}.mp4`);
+    
+    if (fs.existsSync(videoPath)) {
+      try {
+        // Delete the video file
+        fs.unlinkSync(videoPath);
+        
+        // Clean up any remaining chunks
+        const chunkDir = path.join(chunksDir, videoId);
+        if (fs.existsSync(chunkDir)) {
+          const files = fs.readdirSync(chunkDir);
+          files.forEach(file => {
+            fs.unlinkSync(path.join(chunkDir, file));
+          });
+          fs.rmdirSync(chunkDir);
+        }
+        
+        // Update room status
+        rooms[roomId].videoUrl = null;
+        rooms[roomId].videoDeleted = true;
+        
+        // Notify all users in the room
+        io.to(roomId).emit('videoDeleted');
+        
+        console.log(`Video ${videoId} deleted successfully`);
+      } catch (error) {
+        console.error('Error deleting video:', error);
+      }
+    } else {
+      console.log(`Video file not found: ${videoPath}`);
     }
   });
   
@@ -435,5 +626,5 @@ server.listen(PORT, HOST, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Local access: http://localhost:${PORT}/`);
   console.log(`Network access: http://YOUR_IP_ADDRESS:${PORT}/`);
-  console.log(`Video files will be stored in ${uploadsDir}`);
+  console.log(`Video files will be available in the /uploads/ directory`);
 });
