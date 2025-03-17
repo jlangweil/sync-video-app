@@ -12,11 +12,22 @@ const app = express();
 // Enable CORS for all routes
 app.use(cors());
 
+// Increase timeouts for the Express server to handle WebRTC signaling
+app.use((req, res, next) => {
+  // Set timeout to 10 minutes for all requests
+  req.setTimeout(600000);
+  res.setTimeout(600000);
+  next();
+});
+
 // Increase payload size limits for JSON and URL-encoded data
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 const server = http.createServer(app);
+// Increase the server timeout
+server.setTimeout(600000); // 10 minutes
+
 const io = socketIo(server, {
   cors: {
     origin: "*", // Allow all origins
@@ -87,7 +98,12 @@ app.post('/create-room', (req, res) => {
     videoUrl: null,
     hostId: null,
     videoId: videoId,
-    uploadComplete: false
+    uploadComplete: false,
+    streamingInfo: {
+      isStreaming: false,
+      fileName: null,
+      fileType: null
+    }
   };
   
   console.log('Created room:', roomId, 'with pending videoId:', videoId);
@@ -101,6 +117,9 @@ app.post('/create-room', (req, res) => {
 
 // Handle chunk uploads
 app.post('/upload-chunk', (req, res) => {
+  // Increase timeout for this specific route
+  req.setTimeout(300000); // 5 minutes
+  
   const videoId = req.query.videoId;
   const roomId = req.query.roomId;
   const chunkIndex = parseInt(req.query.chunkIndex, 10);
@@ -280,7 +299,12 @@ app.post('/upload', (req, res) => {
       users: [],
       videoUrl: videoUrl,
       hostId: null,
-      uploadComplete: true
+      uploadComplete: true,
+      streamingInfo: {
+        isStreaming: false,
+        fileName: null,
+        fileType: null
+      }
     };
     
     console.log('Created room:', roomId, 'with video:', videoUrl);
@@ -410,7 +434,12 @@ io.on('connection', (socket) => {
         users: [],
         videoUrl: null,
         hostId: isHost ? socket.id : null,
-        uploadComplete: false
+        uploadComplete: false,
+        streamingInfo: {
+          isStreaming: false,
+          fileName: null,
+          fileType: null
+        }
       };
     } else if (isHost && !rooms[roomId].hostId) {
       // If no host is assigned yet, this user becomes host
@@ -451,10 +480,63 @@ io.on('connection', (socket) => {
     } else {
       console.log(`No video URL available to send to user ${username}`);
     }
+    
+    // If there's an active stream, send streaming status
+    if (rooms[roomId].streamingInfo.isStreaming) {
+      socket.emit('streaming-status', {
+        isStreaming: true,
+        fileName: rooms[roomId].streamingInfo.fileName,
+        fileType: rooms[roomId].streamingInfo.fileType
+      });
+    }
+  });
+  
+  // WebRTC signaling handlers
+  socket.on('webrtc-signal', ({ roomId, signal, to }) => {
+    console.log(`Forwarding WebRTC signal from ${socket.id} to ${to}`);
+    socket.to(to).emit('webrtc-signal', {
+      signal,
+      from: socket.id
+    });
+  });
+  
+  socket.on('request-stream', ({ roomId }) => {
+    if (rooms[roomId]) {
+      const hostId = rooms[roomId].hostId;
+      if (hostId) {
+        console.log(`User ${socket.id} requesting stream from host ${hostId} in room ${roomId}`);
+        socket.to(hostId).emit('stream-requested', {
+          from: socket.id,
+          roomId
+        });
+      } else {
+        console.log(`No host found for room ${roomId}`);
+      }
+    }
+  });
+  
+  // Handle streaming status updates
+  socket.on('streaming-status-update', ({ roomId, streaming, fileName, fileType }) => {
+    if (rooms[roomId] && socket.id === rooms[roomId].hostId) {
+      rooms[roomId].streamingInfo = {
+        isStreaming: streaming,
+        fileName,
+        fileType
+      };
+      
+      // Notify all users in the room
+      io.to(roomId).emit('streaming-status', {
+        isStreaming: streaming,
+        fileName,
+        fileType
+      });
+      
+      console.log(`Updated streaming status for room ${roomId}: ${streaming ? 'Streaming' : 'Not streaming'} ${fileName || ''}`);
+    }
   });
   
   // Handle video state changes - only allow from host
-  socket.on('videoStateChange', ({ roomId, videoState }) => {
+  socket.on('videoStateChange', ({ roomId, videoState, toUser }) => {
     if (rooms[roomId]) {
       // Only allow the host to control video state
       if (socket.id === rooms[roomId].hostId) {
@@ -472,9 +554,14 @@ io.on('connection', (socket) => {
             lastUpdate: Date.now()
           };
           
-          // Broadcast new state to everyone EXCEPT the host
-          // This prevents echoing back to the host and causing loops
-          socket.to(roomId).emit('videoStateUpdate', rooms[roomId].videoState);
+          // If a specific user is targeted, only send to them
+          if (toUser) {
+            socket.to(toUser).emit('videoStateUpdate', rooms[roomId].videoState);
+          } else {
+            // Broadcast new state to everyone EXCEPT the host
+            // This prevents echoing back to the host and causing loops
+            socket.to(roomId).emit('videoStateUpdate', rooms[roomId].videoState);
+          }
         } else {
           console.log(`Ignoring minor state update from host to prevent loops`);
         }
