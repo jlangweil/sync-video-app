@@ -35,7 +35,8 @@ const io = socketIo(server, {
     credentials: true
   },
   allowEIO3: true, // Allow compatibility with Socket.io v2 clients
-  transports: ['websocket', 'polling'] // Enable all transports
+  transports: ['websocket', 'polling'], // Enable all transports
+  path: '/socket.io/'
 });
 
 // Create necessary directories
