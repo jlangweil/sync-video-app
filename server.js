@@ -491,6 +491,14 @@ io.on('connection', (socket) => {
       });
     }
   });
+
+  socket.on('streamingAboutToStart', ({ roomId }) => {
+    if (rooms[roomId] && socket.id === rooms[roomId].hostId) {
+      console.log(`Host ${socket.id} is preparing to stream in room ${roomId}`);
+      // Notify all users in the room that streaming is about to start
+      socket.to(roomId).emit('streamingAboutToStart');
+    }
+  });
   
   // WebRTC signaling handlers
   socket.on('webrtc-signal', ({ roomId, signal, to }) => {
