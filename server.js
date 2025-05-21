@@ -30,23 +30,42 @@ const io = socketIo(server, {
     methods: ['GET', 'POST'],
     credentials: true
   },
-  transports: ['websocket', 'polling']
+  transports: ['websocket', 'polling'],
+  pingTimeout: 60000, // Increase ping timeout
+  pingInterval: 25000 // More frequent ping
 });
 
 // Store room data
 const rooms = {};
 const userSocketMap = {};
 const peerIdMap = {};
+// Track connection health data
+const connectionHealth = {};
 
 // Socket.io connection handler
 io.on('connection', (socket) => {
   console.log(`New connection: ${socket.id}`);
+  
+  // Initialize connection health tracking
+  connectionHealth[socket.id] = {
+    lastHeartbeat: Date.now(),
+    isConnected: true,
+    isHost: false,
+    roomId: null,
+    username: null,
+    connectionQuality: 'unknown'
+  };
   
   // Join room
   socket.on('joinRoom', (data) => {
     const { roomId, username, isHost } = data;
     
     console.log(`User ${username} joining room ${roomId} (isHost: ${isHost})`);
+    
+    // Update connection health data
+    connectionHealth[socket.id].roomId = roomId;
+    connectionHealth[socket.id].username = username;
+    connectionHealth[socket.id].isHost = isHost;
     
     // Create room if it doesn't exist
     if (!rooms[roomId]) {
@@ -56,7 +75,9 @@ io.on('connection', (socket) => {
         host: isHost ? socket.id : null,
         streaming: false,
         fileName: null,
-        fileType: null
+        fileType: null,
+        lastActive: Date.now(),
+        syncState: null // For backup state tracking
       };
     }
     
@@ -67,14 +88,16 @@ io.on('connection', (socket) => {
       rooms[roomId].users[existingUserIndex] = {
         id: socket.id,
         username,
-        isHost
+        isHost,
+        lastActive: Date.now()
       };
     } else {
       // Add user to room
       rooms[roomId].users.push({
         id: socket.id,
         username,
-        isHost
+        isHost,
+        lastActive: Date.now()
       });
     }
     
@@ -82,6 +105,9 @@ io.on('connection', (socket) => {
     if (isHost) {
       rooms[roomId].host = socket.id;
     }
+    
+    // Update room last active time
+    rooms[roomId].lastActive = Date.now();
     
     // Map socket ID to room ID for disconnection handling
     userSocketMap[socket.id] = roomId;
@@ -106,24 +132,220 @@ io.on('connection', (socket) => {
       fileType: rooms[roomId].fileType
     });
     
+    // If room has a recent sync state and this is a viewer, send it
+    if (!isHost && rooms[roomId].syncState) {
+      const syncState = rooms[roomId].syncState;
+      // Only send if it's recent (last 2 minutes)
+      if (Date.now() - syncState.timestamp < 120000) {
+        socket.emit('fallback-sync-state', syncState);
+      }
+    }
+    
     console.log(`Room ${roomId} now has ${rooms[roomId].users.length} users`);
   });
   
-  // Register peer ID
-  socket.on('peer-id', (data) => {
-    const { roomId, peerId, isHost, socketId } = data;
+  // Improved heartbeat handler
+  socket.on('heartbeat', (data) => {
+    const { roomId, timestamp, isHost } = data;
     
-    console.log(`Peer ID registered for ${socketId || socket.id}: ${peerId} (isHost: ${isHost})`);
+    // Update connection health data
+    if (connectionHealth[socket.id]) {
+      connectionHealth[socket.id].lastHeartbeat = Date.now();
+      connectionHealth[socket.id].roomId = roomId;
+    }
+    
+    // Update room activity
+    if (rooms[roomId]) {
+      rooms[roomId].lastActive = Date.now();
+      
+      // Update user's last active timestamp
+      const userIndex = rooms[roomId].users.findIndex(u => u.id === socket.id);
+      if (userIndex !== -1) {
+        rooms[roomId].users[userIndex].lastActive = Date.now();
+      }
+    }
+    
+    // Count active viewers
+    let viewerCount = 0;
+    let hostConnected = false;
+    
+    if (rooms[roomId]) {
+      viewerCount = rooms[roomId].users.filter(u => !u.isHost).length;
+      hostConnected = rooms[roomId].users.some(u => u.isHost && u.id !== socket.id);
+    }
+    
+    // Send heartbeat acknowledgment with room stats
+    socket.emit('heartbeat-ack', {
+      timestamp: Date.now(),
+      serverTime: Date.now(),
+      clientTime: timestamp,
+      viewerCount,
+      hostConnected
+    });
+  });
+  
+  // Register peer ID with improved tracking
+  socket.on('peer-id', (data) => {
+    const { roomId, peerId, isHost, previousSocketId } = data;
+    
+    console.log(`Peer ID registered: ${peerId} for socket ${socket.id} (previous: ${previousSocketId || 'N/A'})`);
     
     // Store peer ID mapping
-    peerIdMap[socketId || socket.id] = peerId;
+    peerIdMap[socket.id] = peerId;
+    
+    // If this is a reconnection (previousSocketId provided), update mappings
+    if (previousSocketId && peerIdMap[previousSocketId]) {
+      // Remove the old mapping
+      delete peerIdMap[previousSocketId];
+      console.log(`Removed old peer ID mapping for ${previousSocketId}`);
+    }
     
     // Notify all users in room about the peer ID
     io.to(roomId).emit('peer-id', {
-      socketId: socketId || socket.id,
+      socketId: socket.id,
       peerId,
-      isHost
+      isHost,
+      isReconnection: !!previousSocketId
     });
+  });
+  
+  // Enhanced video state change handler
+  socket.on('videoStateChange', (data) => {
+    const { roomId, videoState } = data;
+    
+    // Log detailed information
+    console.log(`[${socket.id}] Sending ${videoState.isPlaying ? 'PLAY' : 'PAUSE'} at ${videoState.currentTime.toFixed(2)} to room ${roomId}`);
+    
+    if (rooms[roomId]) {
+      // Store sync state for reconnection purposes
+      rooms[roomId].syncState = {
+        ...videoState,
+        timestamp: Date.now(),
+        hostId: socket.id
+      };
+    }
+    
+    // Forward to everyone else in the room immediately
+    socket.to(roomId).emit('videoStateUpdate', {
+      ...videoState,
+      timestamp: Date.now()
+    });
+  });
+  
+  // Enhanced seek operation handler
+  socket.on('videoSeekOperation', (data) => {
+    const { roomId, seekTime, isPlaying, sourceTimestamp } = data;
+    
+    console.log(`[${socket.id}] Sending SEEK to ${seekTime.toFixed(2)} in room ${roomId}`);
+    
+    // Calculate server processing latency
+    const serverTimestamp = Date.now();
+    const latency = sourceTimestamp ? serverTimestamp - sourceTimestamp : 0;
+    
+    // Store sync state for reconnection purposes
+    if (rooms[roomId]) {
+      rooms[roomId].syncState = {
+        currentTime: seekTime,
+        isPlaying: isPlaying !== undefined ? isPlaying : true,
+        timestamp: serverTimestamp,
+        hostId: socket.id,
+        seekOperation: true
+      };
+    }
+    
+    // Notify all viewers about the seek operation
+    socket.to(roomId).emit('videoSeekOperation', {
+      seekTime,
+      isPlaying: isPlaying !== undefined ? isPlaying : true,
+      sourceTimestamp,
+      serverTimestamp,
+      processingLatency: latency,
+      hostId: socket.id
+    });
+  });
+  
+  // Fallback sync state handler
+  socket.on('fallback-sync-state', (data) => {
+    const { roomId, currentTime, isPlaying, timestamp, targetSocketId } = data;
+    
+    console.log(`[${socket.id}] Sending fallback sync state to ${targetSocketId || 'room'}: ${currentTime.toFixed(2)}, ${isPlaying ? 'playing' : 'paused'}`);
+    
+    // Store sync state for reconnection purposes
+    if (rooms[roomId]) {
+      rooms[roomId].syncState = {
+        currentTime,
+        isPlaying,
+        timestamp: timestamp || Date.now(),
+        hostId: socket.id
+      };
+    }
+    
+    // Send to specific target or broadcast to room
+    if (targetSocketId) {
+      io.to(targetSocketId).emit('fallback-sync-state', {
+        currentTime,
+        isPlaying,
+        timestamp: timestamp || Date.now(),
+        hostId: socket.id
+      });
+    } else {
+      socket.to(roomId).emit('fallback-sync-state', {
+        currentTime,
+        isPlaying,
+        timestamp: timestamp || Date.now(),
+        hostId: socket.id
+      });
+    }
+  });
+  
+  // WebRTC connection failure handler
+  socket.on('webrtc-connection-failed', (data) => {
+    const { roomId, peerId } = data;
+    
+    console.log(`WebRTC connection failed in room ${roomId}: ${socket.id} to peer ${peerId}`);
+    
+    // Find socket ID for the peer ID
+    const targetSocketId = Object.keys(peerIdMap).find(key => peerIdMap[key] === peerId);
+    
+    if (targetSocketId) {
+      // Notify the target about connection failure
+      io.to(targetSocketId).emit('webrtc-reconnect-requested', {
+        fromSocketId: socket.id,
+        fromPeerId: peerIdMap[socket.id]
+      });
+      
+      console.log(`Sent reconnection request to ${targetSocketId}`);
+    } else {
+      console.log(`Could not find socket ID for peer ${peerId}`);
+      
+      // Notify original socket that target may be disconnected
+      socket.emit('webrtc-target-unreachable', {
+        peerId,
+        reason: 'Target peer ID not found in mappings'
+      });
+    }
+  });
+  
+  // Viewer requesting reconnection handler
+  socket.on('request-reconnection', (data) => {
+    const { roomId, viewerPeerId } = data;
+    
+    console.log(`Viewer ${socket.id} requesting reconnection in room ${roomId}`);
+    
+    if (rooms[roomId] && rooms[roomId].host) {
+      // Forward the request to the host
+      io.to(rooms[roomId].host).emit('viewer-reconnection-request', {
+        viewerSocketId: socket.id,
+        viewerPeerId
+      });
+      
+      console.log(`Forwarded reconnection request to host ${rooms[roomId].host}`);
+    } else {
+      // Notify viewer that host is not available
+      socket.emit('reconnection-failed', {
+        message: 'Host is not available for reconnection'
+      });
+    }
   });
   
   // Handle chat messages
@@ -140,7 +362,7 @@ io.on('connection', (socket) => {
     });
   });
   
-  // Handle streaming status updates
+  // Enhanced streaming status update handler
   socket.on('streaming-status-update', (data) => {
     const { roomId, streaming, fileName, fileType } = data;
     
@@ -151,6 +373,11 @@ io.on('connection', (socket) => {
       rooms[roomId].fileName = fileName;
       rooms[roomId].fileType = fileType;
       
+      // If streaming is stopping, clear sync state
+      if (!streaming) {
+        rooms[roomId].syncState = null;
+      }
+      
       // Notify all users in room about the streaming status
       io.to(roomId).emit('streaming-status', {
         isStreaming: streaming,
@@ -158,16 +385,6 @@ io.on('connection', (socket) => {
         fileType
       });
     }
-  });
-  
-  // Handle video state changes (play/pause/seek)
-  socket.on('videoStateChange', (data) => {
-    const { roomId, videoState } = data;
-    
-    console.log(`Video state change in room ${roomId}:`, videoState);
-    
-    // Forward video state change to all users in room except sender
-    socket.to(roomId).emit('videoStateUpdate', videoState);
   });
   
   // Handle "about to start streaming" notification
@@ -180,34 +397,65 @@ io.on('connection', (socket) => {
     socket.to(roomId).emit('streamingAboutToStart');
   });
   
-  // Handle WebRTC signaling
-  socket.on('signal', (data) => {
-    const { to, from, signal, type } = data;
+  // Enhanced connection health check
+  socket.on('connection-health-check', (data) => {
+    const { roomId, targetSocketId } = data;
     
-    console.log(`Signal from ${from} to ${to} (${type})`);
+    console.log(`Connection health check from ${socket.id} to ${targetSocketId || 'all'} in room ${roomId}`);
     
-    // Forward signal to recipient
-    io.to(to).emit('signal', {
-      from,
-      signal,
-      type
-    });
+    // If checking a specific user
+    if (targetSocketId) {
+      // Check if target is still connected
+      const isConnected = io.sockets.sockets.has(targetSocketId);
+      
+      // Get connection health data
+      const health = connectionHealth[targetSocketId] || { lastHeartbeat: 0 };
+      const timeSinceHeartbeat = Date.now() - health.lastHeartbeat;
+      
+      // Send health check response
+      socket.emit('connection-health-response', {
+        targetSocketId,
+        isConnected,
+        timeSinceHeartbeat,
+        timestamp: Date.now()
+      });
+      
+      // Also notify the target that someone is checking their connection
+      if (isConnected) {
+        io.to(targetSocketId).emit('connection-being-checked', {
+          fromSocketId: socket.id,
+          timestamp: Date.now()
+        });
+      }
+    } else {
+      // Check all users in the room
+      if (rooms[roomId]) {
+        const healthStatus = {};
+        
+        // Get status for each user
+        rooms[roomId].users.forEach(user => {
+          const isConnected = io.sockets.sockets.has(user.id);
+          const health = connectionHealth[user.id] || { lastHeartbeat: 0 };
+          const timeSinceHeartbeat = Date.now() - health.lastHeartbeat;
+          
+          healthStatus[user.id] = {
+            isConnected,
+            timeSinceHeartbeat,
+            isActive: timeSinceHeartbeat < 10000 // Consider active if heartbeat within 10s
+          };
+        });
+        
+        // Send room health status
+        socket.emit('room-health-status', {
+          roomId,
+          users: healthStatus,
+          timestamp: Date.now()
+        });
+      }
+    }
   });
   
-  // Handle ICE candidate exchange
-  socket.on('ice-candidate', (data) => {
-    const { to, candidate } = data;
-    
-    console.log(`ICE candidate from ${socket.id} to ${to}`);
-    
-    // Forward ICE candidate to recipient
-    io.to(to).emit('ice-candidate', {
-      from: socket.id,
-      candidate
-    });
-  });
-  
-  // Handle disconnection
+  // Handle disconnection with improved cleanup
   socket.on('disconnect', () => {
     console.log(`User disconnected: ${socket.id}`);
     
@@ -215,49 +463,84 @@ io.on('connection', (socket) => {
     const roomId = userSocketMap[socket.id];
     
     if (roomId && rooms[roomId]) {
-      // Get username before removing from room
+      // Get user info before removing
       const user = rooms[roomId].users.find(u => u.id === socket.id);
       const username = user ? user.username : 'Unknown user';
+      const wasHost = user ? user.isHost : false;
       
-      // Remove user from room
-      rooms[roomId].users = rooms[roomId].users.filter(user => user.id !== socket.id);
+      console.log(`Disconnected user details: ${username}, isHost: ${wasHost}`);
       
-      // If room is empty, remove it
-      if (rooms[roomId].users.length === 0) {
-        delete rooms[roomId];
-        console.log(`Room ${roomId} deleted (empty)`);
-      } else {
-        // If host left, assign new host if possible
-        if (rooms[roomId].host === socket.id) {
-          rooms[roomId].host = null;
-          rooms[roomId].streaming = false;
-          
-          // Notify all users that streaming has stopped
-          io.to(roomId).emit('streaming-status', {
-            isStreaming: false,
-            fileName: null,
-            fileType: null
-          });
-          
-          console.log(`Host left room ${roomId}, streaming stopped`);
-        }
-        
-        // Notify remaining users that this user left
-        io.to(roomId).emit('userLeft', {
-          username,
-          users: rooms[roomId].users
-        });
-        
-        console.log(`User ${username} left room ${roomId}`);
+      // Update connection health
+      if (connectionHealth[socket.id]) {
+        connectionHealth[socket.id].isConnected = false;
+        connectionHealth[socket.id].disconnectedAt = Date.now();
       }
+      
+      // Don't immediately remove user - mark as inactive for potential reconnection
+      if (user) {
+        user.active = false;
+        user.disconnectedAt = Date.now();
+        
+        // Schedule cleanup after 30 seconds if not reconnected
+        setTimeout(() => {
+          if (rooms[roomId] && rooms[roomId].users) {
+            // Check if user is still in inactive state
+            const currentUser = rooms[roomId].users.find(u => u.id === socket.id);
+            if (currentUser && currentUser.active === false) {
+              // Remove user after timeout
+              rooms[roomId].users = rooms[roomId].users.filter(u => u.id !== socket.id);
+              
+              // If room is empty, remove it
+              if (rooms[roomId].users.length === 0) {
+                delete rooms[roomId];
+                console.log(`Room ${roomId} deleted (empty)`);
+              } else {
+                // If host left and hasn't reconnected, update room state
+                if (wasHost && rooms[roomId].host === socket.id) {
+                  rooms[roomId].host = null;
+                  rooms[roomId].streaming = false;
+                  
+                  // Notify all users that streaming has stopped
+                  io.to(roomId).emit('streaming-status', {
+                    isStreaming: false,
+                    fileName: null,
+                    fileType: null
+                  });
+                  
+                  console.log(`Host left room ${roomId}, streaming stopped`);
+                }
+                
+                // Notify remaining users that this user left
+                io.to(roomId).emit('userLeft', {
+                  username,
+                  users: rooms[roomId].users.filter(u => u.active !== false)
+                });
+                
+                console.log(`User ${username} removed from room ${roomId} after timeout`);
+              }
+            }
+          }
+          
+          // Clean up connection health
+          delete connectionHealth[socket.id];
+        }, 30000); // 30 second grace period for reconnection
+      }
+      
+      // Immediately notify other users that this user has disconnected
+      // (but might reconnect)
+      io.to(roomId).emit('userDisconnected', {
+        userId: socket.id,
+        username,
+        isHost: wasHost,
+        timestamp: Date.now()
+      });
     }
     
-    // Clean up mapping
-    delete userSocketMap[socket.id];
-    delete peerIdMap[socket.id];
+    // Don't immediately remove socket from maps to allow for reconnection
+    // These will be cleaned up if the user doesn't reconnect
   });
   
-  // Handle room creation
+  // Room creation with improved validation
   socket.on('create-room', (_, callback) => {
     // Generate a random room ID
     const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
@@ -281,6 +564,80 @@ io.on('connection', (socket) => {
   });
 });
 
+// Periodic connection health check (run every 15 seconds)
+setInterval(() => {
+  const now = Date.now();
+  
+  // Check each room's health
+  Object.keys(rooms).forEach(roomId => {
+    const room = rooms[roomId];
+    
+    // Skip recent rooms
+    if (now - room.lastActive < 15000) return;
+    
+    // Check each user's connection health
+    room.users.forEach(user => {
+      // Skip already marked inactive users
+      if (user.active === false) return;
+      
+      const health = connectionHealth[user.id];
+      
+      // If no health data or last heartbeat is too old (over 30 seconds)
+      if (!health || now - health.lastHeartbeat > 30000) {
+        console.log(`User ${user.username} (${user.id}) in room ${roomId} appears disconnected`);
+        
+        // Check if socket is actually connected
+        const isConnected = io.sockets.sockets.has(user.id);
+        
+        if (!isConnected) {
+          console.log(`Confirming ${user.id} is disconnected, marking as inactive`);
+          // Mark as inactive
+          user.active = false;
+          user.disconnectedAt = now;
+          
+          // Notify room that user appears disconnected
+          io.to(roomId).emit('userConnectionLost', {
+            userId: user.id,
+            username: user.username,
+            isHost: user.isHost
+          });
+          
+          // If host disconnected, notify viewers
+          if (user.isHost) {
+            io.to(roomId).emit('hostConnectionLost', {
+              timestamp: now
+            });
+          }
+        }
+      }
+    });
+    
+    // Cleanup old inactive users (disconnected for more than 5 minutes)
+    room.users = room.users.filter(user => {
+      if (user.active === false && now - user.disconnectedAt > 300000) {
+        console.log(`Removing inactive user ${user.username} (${user.id}) from room ${roomId}`);
+        return false;
+      }
+      return true;
+    });
+    
+    // If room is empty or inactive for 30 minutes, remove it
+    if (room.users.length === 0 || now - room.lastActive > 1800000) {
+      delete rooms[roomId];
+      console.log(`Removed inactive room ${roomId}`);
+    }
+  });
+  
+  // Clean up stale connection health data
+  Object.keys(connectionHealth).forEach(socketId => {
+    const health = connectionHealth[socketId];
+    // If disconnected for more than 5 minutes, remove data
+    if (!health.isConnected && now - health.disconnectedAt > 300000) {
+      delete connectionHealth[socketId];
+    }
+  });
+}, 15000);
+
 // Create room endpoint
 app.post('/create-room', (req, res) => {
   // Generate a random room ID
@@ -300,9 +657,19 @@ app.post('/create-room', (req, res) => {
   res.json({ roomId });
 });
 
-// Health check endpoint
+// Health check endpoint with enhanced diagnostics
 app.get('/health', (req, res) => {
-  res.status(200).send('OK');
+  // Basic system health metrics
+  const healthData = {
+    status: 'OK',
+    uptime: process.uptime(),
+    timestamp: Date.now(),
+    rooms: Object.keys(rooms).length,
+    connections: Object.keys(connectionHealth).filter(id => connectionHealth[id].isConnected).length,
+    activeUsers: Object.values(rooms).reduce((count, room) => count + room.users.length, 0)
+  };
+  
+  res.status(200).json(healthData);
 });
 
 // Start server
