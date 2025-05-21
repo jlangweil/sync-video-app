@@ -53,19 +53,21 @@ io.on('connection', (socket) => {
     isHost: false,
     roomId: null,
     username: null,
-    connectionQuality: 'unknown'
+    connectionQuality: 'unknown',
+    isChatOnly: false
   };
   
   // Join room
   socket.on('joinRoom', (data) => {
-    const { roomId, username, isHost } = data;
+    const { roomId, username, isHost, isChatOnly } = data;
     
-    console.log(`User ${username} joining room ${roomId} (isHost: ${isHost})`);
+    console.log(`User ${username} joining room ${roomId} (isHost: ${isHost}, isChatOnly: ${isChatOnly || false})`);
     
     // Update connection health data
     connectionHealth[socket.id].roomId = roomId;
     connectionHealth[socket.id].username = username;
     connectionHealth[socket.id].isHost = isHost;
+    connectionHealth[socket.id].isChatOnly = isChatOnly || false;
     
     // Create room if it doesn't exist
     if (!rooms[roomId]) {
@@ -89,6 +91,7 @@ io.on('connection', (socket) => {
         id: socket.id,
         username,
         isHost,
+        isChatOnly: isChatOnly || false,
         lastActive: Date.now()
       };
     } else {
@@ -97,6 +100,7 @@ io.on('connection', (socket) => {
         id: socket.id,
         username,
         isHost,
+        isChatOnly: isChatOnly || false,
         lastActive: Date.now()
       });
     }
@@ -120,20 +124,21 @@ io.on('connection', (socket) => {
       user: {
         id: socket.id,
         username,
-        isHost
+        isHost,
+        isChatOnly: isChatOnly || false
       },
       users: rooms[roomId].users
     });
     
-    // Send current streaming status to new user
+    // Send current streaming status to new user (skip for chat-only users if preferred)
     socket.emit('streaming-status', {
       isStreaming: rooms[roomId].streaming,
       fileName: rooms[roomId].fileName,
       fileType: rooms[roomId].fileType
     });
     
-    // If room has a recent sync state and this is a viewer, send it
-    if (!isHost && rooms[roomId].syncState) {
+    // If room has a recent sync state and this is a viewer, send it (skip for chat-only users)
+    if (!isHost && !isChatOnly && rooms[roomId].syncState) {
       const syncState = rooms[roomId].syncState;
       // Only send if it's recent (last 2 minutes)
       if (Date.now() - syncState.timestamp < 120000) {
@@ -168,9 +173,11 @@ io.on('connection', (socket) => {
     // Count active viewers
     let viewerCount = 0;
     let hostConnected = false;
+    let chatOnlyCount = 0;
     
     if (rooms[roomId]) {
-      viewerCount = rooms[roomId].users.filter(u => !u.isHost).length;
+      viewerCount = rooms[roomId].users.filter(u => !u.isHost && !u.isChatOnly).length;
+      chatOnlyCount = rooms[roomId].users.filter(u => u.isChatOnly).length;
       hostConnected = rooms[roomId].users.some(u => u.isHost && u.id !== socket.id);
     }
     
@@ -180,6 +187,7 @@ io.on('connection', (socket) => {
       serverTime: Date.now(),
       clientTime: timestamp,
       viewerCount,
+      chatOnlyCount,
       hostConnected
     });
   });
@@ -225,11 +233,27 @@ io.on('connection', (socket) => {
       };
     }
     
-    // Forward to everyone else in the room immediately
-    socket.to(roomId).emit('videoStateUpdate', {
-      ...videoState,
-      timestamp: Date.now()
-    });
+    // Forward to everyone in the room except the sender and chat-only users
+    if (rooms[roomId]) {
+      // Get non-chat-only users
+      const regularViewers = rooms[roomId].users.filter(user => 
+        user.id !== socket.id && !user.isChatOnly
+      );
+      
+      // Emit to each regular viewer
+      regularViewers.forEach(viewer => {
+        io.to(viewer.id).emit('videoStateUpdate', {
+          ...videoState,
+          timestamp: Date.now()
+        });
+      });
+    } else {
+      // Fallback if room data is not available
+      socket.to(roomId).emit('videoStateUpdate', {
+        ...videoState,
+        timestamp: Date.now()
+      });
+    }
   });
   
   // Enhanced seek operation handler
@@ -251,17 +275,34 @@ io.on('connection', (socket) => {
         hostId: socket.id,
         seekOperation: true
       };
+      
+      // Get non-chat-only users
+      const regularViewers = rooms[roomId].users.filter(user => 
+        user.id !== socket.id && !user.isChatOnly
+      );
+      
+      // Emit to each regular viewer
+      regularViewers.forEach(viewer => {
+        io.to(viewer.id).emit('videoSeekOperation', {
+          seekTime,
+          isPlaying: isPlaying !== undefined ? isPlaying : true,
+          sourceTimestamp,
+          serverTimestamp,
+          processingLatency: latency,
+          hostId: socket.id
+        });
+      });
+    } else {
+      // Fallback if room data is not available
+      socket.to(roomId).emit('videoSeekOperation', {
+        seekTime,
+        isPlaying: isPlaying !== undefined ? isPlaying : true,
+        sourceTimestamp,
+        serverTimestamp,
+        processingLatency: latency,
+        hostId: socket.id
+      });
     }
-    
-    // Notify all viewers about the seek operation
-    socket.to(roomId).emit('videoSeekOperation', {
-      seekTime,
-      isPlaying: isPlaying !== undefined ? isPlaying : true,
-      sourceTimestamp,
-      serverTimestamp,
-      processingLatency: latency,
-      hostId: socket.id
-    });
   });
   
   // Fallback sync state handler
@@ -280,21 +321,42 @@ io.on('connection', (socket) => {
       };
     }
     
-    // Send to specific target or broadcast to room
+    // Send to specific target if provided
     if (targetSocketId) {
-      io.to(targetSocketId).emit('fallback-sync-state', {
-        currentTime,
-        isPlaying,
-        timestamp: timestamp || Date.now(),
-        hostId: socket.id
-      });
+      // Check if target is not a chat-only user
+      const targetUser = rooms[roomId]?.users.find(user => user.id === targetSocketId);
+      if (targetUser && !targetUser.isChatOnly) {
+        io.to(targetSocketId).emit('fallback-sync-state', {
+          currentTime,
+          isPlaying,
+          timestamp: timestamp || Date.now(),
+          hostId: socket.id
+        });
+      }
     } else {
-      socket.to(roomId).emit('fallback-sync-state', {
-        currentTime,
-        isPlaying,
-        timestamp: timestamp || Date.now(),
-        hostId: socket.id
-      });
+      // Send to all non-chat-only users in room
+      if (rooms[roomId]) {
+        const regularViewers = rooms[roomId].users.filter(user => 
+          user.id !== socket.id && !user.isChatOnly
+        );
+        
+        regularViewers.forEach(viewer => {
+          io.to(viewer.id).emit('fallback-sync-state', {
+            currentTime,
+            isPlaying,
+            timestamp: timestamp || Date.now(),
+            hostId: socket.id
+          });
+        });
+      } else {
+        // Fallback if room data is not available
+        socket.to(roomId).emit('fallback-sync-state', {
+          currentTime,
+          isPlaying,
+          timestamp: timestamp || Date.now(),
+          hostId: socket.id
+        });
+      }
     }
   });
   
@@ -308,13 +370,23 @@ io.on('connection', (socket) => {
     const targetSocketId = Object.keys(peerIdMap).find(key => peerIdMap[key] === peerId);
     
     if (targetSocketId) {
-      // Notify the target about connection failure
-      io.to(targetSocketId).emit('webrtc-reconnect-requested', {
-        fromSocketId: socket.id,
-        fromPeerId: peerIdMap[socket.id]
-      });
-      
-      console.log(`Sent reconnection request to ${targetSocketId}`);
+      // Check if the target is not a chat-only user
+      const targetUser = rooms[roomId]?.users.find(user => user.id === targetSocketId);
+      if (targetUser && !targetUser.isChatOnly) {
+        // Notify the target about connection failure
+        io.to(targetSocketId).emit('webrtc-reconnect-requested', {
+          fromSocketId: socket.id,
+          fromPeerId: peerIdMap[socket.id]
+        });
+        
+        console.log(`Sent reconnection request to ${targetSocketId}`);
+      } else if (targetUser && targetUser.isChatOnly) {
+        // If target is chat-only, notify sender that WebRTC is not needed
+        socket.emit('webrtc-target-unreachable', {
+          peerId,
+          reason: 'Target is in chat-only mode and does not require video stream'
+        });
+      }
     } else {
       console.log(`Could not find socket ID for peer ${peerId}`);
       
@@ -378,8 +450,19 @@ io.on('connection', (socket) => {
         rooms[roomId].syncState = null;
       }
       
-      // Notify all users in room about the streaming status
-      io.to(roomId).emit('streaming-status', {
+      // Notify non-chat-only users in room about the streaming status
+      rooms[roomId].users.forEach(user => {
+        if (!user.isChatOnly) {
+          io.to(user.id).emit('streaming-status', {
+            isStreaming: streaming,
+            fileName,
+            fileType
+          });
+        }
+      });
+    } else {
+      // Fallback if room data is not available
+      socket.to(roomId).emit('streaming-status', {
         isStreaming: streaming,
         fileName,
         fileType
@@ -393,8 +476,19 @@ io.on('connection', (socket) => {
     
     console.log(`Host is about to start streaming in room ${roomId}`);
     
-    // Notify viewers that host is about to start streaming
-    socket.to(roomId).emit('streamingAboutToStart');
+    // Notify non-chat-only viewers that host is about to start streaming
+    if (rooms[roomId]) {
+      const regularViewers = rooms[roomId].users.filter(user => 
+        user.id !== socket.id && !user.isChatOnly
+      );
+      
+      regularViewers.forEach(viewer => {
+        io.to(viewer.id).emit('streamingAboutToStart');
+      });
+    } else {
+      // Fallback if room data is not available
+      socket.to(roomId).emit('streamingAboutToStart');
+    }
   });
   
   // Enhanced connection health check
@@ -411,12 +505,14 @@ io.on('connection', (socket) => {
       // Get connection health data
       const health = connectionHealth[targetSocketId] || { lastHeartbeat: 0 };
       const timeSinceHeartbeat = Date.now() - health.lastHeartbeat;
+      const isChatOnly = health.isChatOnly || false;
       
       // Send health check response
       socket.emit('connection-health-response', {
         targetSocketId,
         isConnected,
         timeSinceHeartbeat,
+        isChatOnly,
         timestamp: Date.now()
       });
       
@@ -441,7 +537,8 @@ io.on('connection', (socket) => {
           healthStatus[user.id] = {
             isConnected,
             timeSinceHeartbeat,
-            isActive: timeSinceHeartbeat < 10000 // Consider active if heartbeat within 10s
+            isActive: timeSinceHeartbeat < 10000, // Consider active if heartbeat within 10s
+            isChatOnly: user.isChatOnly || false
           };
         });
         
@@ -467,8 +564,9 @@ io.on('connection', (socket) => {
       const user = rooms[roomId].users.find(u => u.id === socket.id);
       const username = user ? user.username : 'Unknown user';
       const wasHost = user ? user.isHost : false;
+      const wasChatOnly = user ? user.isChatOnly : false;
       
-      console.log(`Disconnected user details: ${username}, isHost: ${wasHost}`);
+      console.log(`Disconnected user details: ${username}, isHost: ${wasHost}, isChatOnly: ${wasChatOnly}`);
       
       // Update connection health
       if (connectionHealth[socket.id]) {
@@ -500,11 +598,15 @@ io.on('connection', (socket) => {
                   rooms[roomId].host = null;
                   rooms[roomId].streaming = false;
                   
-                  // Notify all users that streaming has stopped
-                  io.to(roomId).emit('streaming-status', {
-                    isStreaming: false,
-                    fileName: null,
-                    fileType: null
+                  // Notify all non-chat-only users that streaming has stopped
+                  rooms[roomId].users.forEach(u => {
+                    if (!u.isChatOnly) {
+                      io.to(u.id).emit('streaming-status', {
+                        isStreaming: false,
+                        fileName: null,
+                        fileType: null
+                      });
+                    }
                   });
                   
                   console.log(`Host left room ${roomId}, streaming stopped`);
@@ -532,6 +634,7 @@ io.on('connection', (socket) => {
         userId: socket.id,
         username,
         isHost: wasHost,
+        isChatOnly: wasChatOnly,
         timestamp: Date.now()
       });
     }
@@ -599,13 +702,19 @@ setInterval(() => {
           io.to(roomId).emit('userConnectionLost', {
             userId: user.id,
             username: user.username,
-            isHost: user.isHost
+            isHost: user.isHost,
+            isChatOnly: user.isChatOnly || false
           });
           
           // If host disconnected, notify viewers
           if (user.isHost) {
-            io.to(roomId).emit('hostConnectionLost', {
-              timestamp: now
+            // Notify only the non-chat-only users
+            room.users.forEach(u => {
+              if (!u.isChatOnly) {
+                io.to(u.id).emit('hostConnectionLost', {
+                  timestamp: now
+                });
+              }
             });
           }
         }
@@ -641,7 +750,7 @@ setInterval(() => {
 // Create room endpoint
 app.post('/create-room', (req, res) => {
   // Generate a random room ID
-  const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  const characters = '0123456789';
   let roomId = '';
   
   // Ensure unique room ID
@@ -666,7 +775,10 @@ app.get('/health', (req, res) => {
     timestamp: Date.now(),
     rooms: Object.keys(rooms).length,
     connections: Object.keys(connectionHealth).filter(id => connectionHealth[id].isConnected).length,
-    activeUsers: Object.values(rooms).reduce((count, room) => count + room.users.length, 0)
+    activeUsers: Object.values(rooms).reduce((count, room) => count + room.users.length, 0),
+    chatOnlyUsers: Object.values(rooms).reduce((count, room) => 
+      count + room.users.filter(user => user.isChatOnly).length, 0
+    )
   };
   
   res.status(200).json(healthData);
