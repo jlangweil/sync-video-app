@@ -491,6 +491,20 @@ io.on('connection', (socket) => {
     }
   });
   
+  // Forward host play/pause events to viewers
+  socket.on('hostVideoPlayPause', (data) => {
+    const { roomId, paused } = data;
+
+    if (rooms[roomId]) {
+      const regularViewers = rooms[roomId].users.filter(user =>
+        user.id !== socket.id && !user.isChatOnly
+      );
+      regularViewers.forEach(viewer => {
+        io.to(viewer.id).emit('hostVideoPlayPause', { paused });
+      });
+    }
+  });
+
   // Enhanced connection health check
   socket.on('connection-health-check', (data) => {
     const { roomId, targetSocketId } = data;
