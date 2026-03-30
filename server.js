@@ -3,6 +3,10 @@ const http = require('http');
 const socketIo = require('socket.io');
 const cors = require('cors');
 const path = require('path');
+const fs = require('fs');
+const fsp = fs.promises;
+const crypto = require('crypto');
+const multer = require('multer');
 
 const app = express();
 const server = http.createServer(app);
@@ -10,7 +14,7 @@ const server = http.createServer(app);
 // Enable CORS for all routes
 app.use(cors({
   origin: '*',
-  methods: ['GET', 'POST', 'OPTIONS'],
+  methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
   credentials: true
 }));
 
@@ -41,6 +45,71 @@ const userSocketMap = {};
 const peerIdMap = {};
 // Track connection health data
 const connectionHealth = {};
+
+// ─── Upload tracking ────────────────────────────────────────────────────────
+// { [uploadId]: { roomId, fileName, fileType, fileSize, totalChunks, receivedChunks, assembled, ext } }
+const uploads = {};
+
+// Ensure upload directories exist
+const uploadsDir = path.join(__dirname, 'uploads');
+const chunksDir  = path.join(__dirname, 'chunks');
+fs.mkdirSync(uploadsDir, { recursive: true });
+fs.mkdirSync(chunksDir,  { recursive: true });
+
+// On startup: remove leftover files from previous sessions
+fsp.readdir(uploadsDir).then(files =>
+  Promise.all(files.map(f => fsp.unlink(path.join(uploadsDir, f)).catch(() => {})))
+).catch(() => {});
+fsp.readdir(chunksDir).then(dirs =>
+  Promise.all(dirs.map(d => fsp.rm(path.join(chunksDir, d), { recursive: true, force: true }).catch(() => {})))
+).catch(() => {});
+
+// Multer storage: save each chunk as chunks/<uploadId>/chunk_000000
+const chunkStorage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const dir = path.join(chunksDir, req.params.uploadId);
+    fs.mkdirSync(dir, { recursive: true });
+    cb(null, dir);
+  },
+  filename: (req, file, cb) => {
+    // chunkIndex comes from URL param to avoid multipart field ordering issues
+    const idx = parseInt(req.params.chunkIndex, 10);
+    cb(null, `chunk_${String(idx).padStart(6, '0')}`);
+  }
+});
+const chunkUpload = multer({ storage: chunkStorage });
+
+// Async chunk assembly — uses streams so the event loop is never blocked
+async function assembleChunks(uploadId, totalChunks, destPath) {
+  const chunkDir = path.join(chunksDir, uploadId);
+  const writeStream = fs.createWriteStream(destPath);
+  for (let i = 0; i < totalChunks; i++) {
+    const chunkPath = path.join(chunkDir, `chunk_${String(i).padStart(6, '0')}`);
+    await new Promise((resolve, reject) => {
+      const rs = fs.createReadStream(chunkPath);
+      rs.pipe(writeStream, { end: false });
+      rs.on('end', resolve);
+      rs.on('error', reject);
+    });
+  }
+  await new Promise((resolve, reject) => {
+    writeStream.end();
+    writeStream.on('finish', resolve);
+    writeStream.on('error', reject);
+  });
+  await fsp.rm(chunkDir, { recursive: true, force: true }).catch(() => {});
+}
+
+// Delete an uploaded file and its metadata
+async function deleteUploadedFile(uploadId) {
+  const meta = uploads[uploadId];
+  if (!meta) return;
+  const filePath = path.join(uploadsDir, `${uploadId}.${meta.ext}`);
+  await fsp.unlink(filePath).catch(() => {});
+  await fsp.rm(path.join(chunksDir, uploadId), { recursive: true, force: true }).catch(() => {});
+  delete uploads[uploadId];
+  console.log(`Cleaned up upload ${uploadId}`);
+}
 
 // Socket.io connection handler
 io.on('connection', (socket) => {
@@ -134,7 +203,8 @@ io.on('connection', (socket) => {
     socket.emit('streaming-status', {
       isStreaming: rooms[roomId].streaming,
       fileName: rooms[roomId].fileName,
-      fileType: rooms[roomId].fileType
+      fileType: rooms[roomId].fileType,
+      uploadId: rooms[roomId].uploadId || null
     });
     
     // If room has a recent sync state and this is a viewer, send it (skip for chat-only users)
@@ -142,7 +212,10 @@ io.on('connection', (socket) => {
       const syncState = rooms[roomId].syncState;
       // Only send if it's recent (last 2 minutes)
       if (Date.now() - syncState.timestamp < 120000) {
-        socket.emit('fallback-sync-state', syncState);
+        socket.emit('fallback-sync-state', {
+          ...syncState,
+          uploadId: rooms[roomId].uploadId || null
+        });
       }
     }
     
@@ -437,26 +510,29 @@ io.on('connection', (socket) => {
   // Enhanced streaming status update handler
   socket.on('streaming-status-update', (data) => {
     const { roomId, streaming, fileName, fileType } = data;
-    
+
     console.log(`Streaming status update for room ${roomId}: ${streaming}`);
-    
+
     if (rooms[roomId]) {
       rooms[roomId].streaming = streaming;
       rooms[roomId].fileName = fileName;
       rooms[roomId].fileType = fileType;
-      
-      // If streaming is stopping, clear sync state
+
+      // If streaming is stopping, clear sync state and file reference
       if (!streaming) {
         rooms[roomId].syncState = null;
+        rooms[roomId].uploadId = null;
       }
-      
+
       // Notify non-chat-only users in room about the streaming status
+      const uploadId = rooms[roomId].uploadId || null;
       rooms[roomId].users.forEach(user => {
         if (!user.isChatOnly) {
           io.to(user.id).emit('streaming-status', {
             isStreaming: streaming,
             fileName,
-            fileType
+            fileType,
+            uploadId
           });
         }
       });
@@ -465,7 +541,8 @@ io.on('connection', (socket) => {
       socket.to(roomId).emit('streaming-status', {
         isStreaming: streaming,
         fileName,
-        fileType
+        fileType,
+        uploadId: null
       });
     }
   });
@@ -610,20 +687,10 @@ io.on('connection', (socket) => {
                 // If host left and hasn't reconnected, update room state
                 if (wasHost && rooms[roomId].host === socket.id) {
                   rooms[roomId].host = null;
-                  rooms[roomId].streaming = false;
-                  
-                  // Notify all non-chat-only users that streaming has stopped
-                  rooms[roomId].users.forEach(u => {
-                    if (!u.isChatOnly) {
-                      io.to(u.id).emit('streaming-status', {
-                        isStreaming: false,
-                        fileName: null,
-                        fileType: null
-                      });
-                    }
-                  });
-                  
-                  console.log(`Host left room ${roomId}, streaming stopped`);
+                  // Don't delete the uploaded file here — the host may reconnect
+                  // and viewers may still be downloading. File is cleaned up when
+                  // the host explicitly stops streaming or the room expires.
+                  console.log(`Host left room ${roomId} after grace period`);
                 }
                 
                 // Notify remaining users that this user left
@@ -778,6 +845,102 @@ app.post('/create-room', (req, res) => {
   console.log(`API created new room: ${roomId}`);
   
   res.json({ roomId });
+});
+
+// ─── Upload / Streaming Routes ───────────────────────────────────────────────
+
+// POST /upload/init — client calls this first to get an uploadId
+app.post('/upload/init', express.json(), (req, res) => {
+  const { fileName, fileType, fileSize, roomId, totalChunks } = req.body;
+  if (!fileName || !fileType || !roomId || !totalChunks) {
+    return res.status(400).json({ error: 'Missing required fields' });
+  }
+  // Derive safe extension from MIME type or filename
+  const extMap = { 'x-matroska': 'mkv', 'x-msvideo': 'avi', quicktime: 'mov', 'x-ms-wmv': 'wmv', 'x-flv': 'flv' };
+  let ext = (fileType.split('/')[1] || 'mp4').split(';')[0].trim();
+  ext = extMap[ext] || ext;
+
+  const uploadId = crypto.randomBytes(8).toString('hex');
+  uploads[uploadId] = { roomId, fileName, fileType, fileSize, totalChunks: parseInt(totalChunks, 10), receivedChunks: 0, assembled: false, ext };
+
+  if (rooms[roomId]) rooms[roomId].uploadId = uploadId;
+  console.log(`Upload init: ${uploadId} (${fileName}, ${totalChunks} chunks)`);
+  res.json({ uploadId });
+});
+
+// POST /upload/chunk/:uploadId/:chunkIndex — upload one chunk (multipart, field name "chunk")
+app.post('/upload/chunk/:uploadId/:chunkIndex', (req, res, next) => {
+  if (!uploads[req.params.uploadId]) return res.status(404).json({ error: 'Upload not found' });
+  next();
+}, chunkUpload.single('chunk'), async (req, res) => {
+  const { uploadId } = req.params;
+  const meta = uploads[uploadId];
+  meta.receivedChunks++;
+  res.json({ received: meta.receivedChunks, total: meta.totalChunks });
+
+  if (meta.receivedChunks === meta.totalChunks && !meta.assembled) {
+    meta.assembled = true;
+    const destPath = path.join(uploadsDir, `${uploadId}.${meta.ext}`);
+    try {
+      await assembleChunks(uploadId, meta.totalChunks, destPath);
+      console.log(`Stream ready: ${uploadId} (${meta.fileName})`);
+      if (rooms[meta.roomId]) {
+        io.to(meta.roomId).emit('stream-ready', {
+          uploadId,
+          streamUrl: `/stream/${uploadId}`,
+          fileName: meta.fileName,
+          fileType: meta.fileType,
+          fileSize: meta.fileSize
+        });
+      }
+    } catch (err) {
+      console.error(`Assembly failed for ${uploadId}:`, err);
+      meta.assembled = false;
+      if (rooms[meta.roomId]) {
+        io.to(meta.roomId).emit('stream-error', { message: 'File assembly failed on server' });
+      }
+    }
+  }
+});
+
+// GET /stream/:uploadId — serve video with HTTP Range request support
+app.get('/stream/:uploadId', (req, res) => {
+  const meta = uploads[req.params.uploadId];
+  if (!meta) return res.status(404).json({ error: 'File not found' });
+  const filePath = path.join(uploadsDir, `${req.params.uploadId}.${meta.ext}`);
+  if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'File not on disk' });
+
+  const fileSize = fs.statSync(filePath).size;
+  const contentType = meta.fileType || 'video/mp4';
+  const range = req.headers.range;
+
+  if (range) {
+    const [startStr, endStr] = range.replace(/bytes=/, '').split('-');
+    const start = parseInt(startStr, 10);
+    const end = endStr ? parseInt(endStr, 10) : fileSize - 1;
+    res.writeHead(206, {
+      'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+      'Accept-Ranges': 'bytes',
+      'Content-Length': end - start + 1,
+      'Content-Type': contentType,
+      'Cache-Control': 'no-cache'
+    });
+    fs.createReadStream(filePath, { start, end }).pipe(res);
+  } else {
+    res.writeHead(200, {
+      'Content-Length': fileSize,
+      'Content-Type': contentType,
+      'Accept-Ranges': 'bytes',
+      'Cache-Control': 'no-cache'
+    });
+    fs.createReadStream(filePath).pipe(res);
+  }
+});
+
+// DELETE /upload/:uploadId — explicit cleanup (called by client on stopStreaming)
+app.delete('/upload/:uploadId', async (req, res) => {
+  await deleteUploadedFile(req.params.uploadId);
+  res.json({ deleted: true });
 });
 
 // Health check endpoint with enhanced diagnostics
