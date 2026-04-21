@@ -333,6 +333,18 @@ io.on('connection', (socket) => {
       uploadId: rooms[roomId].uploadId || null
     });
 
+    // If assembly is in progress but stream-ready hasn't fired yet, send the current
+    // buffer progress so late-joining viewers don't get stuck at "Waiting for upload…".
+    if (!isHost && !isChatOnly && rooms[roomId].uploadId) {
+      const uid = rooms[roomId].uploadId;
+      const meta = uploads[uid];
+      if (meta && !meta.streamReadyEmitted && meta.assembledChunks > 0) {
+        const thresholdChunks = Math.ceil(meta.totalChunks * STREAM_READY_THRESHOLD);
+        const pct = Math.min(99, Math.round((meta.assembledChunks / thresholdChunks) * 100));
+        socket.emit('stream-buffering', { progress: pct });
+      }
+    }
+
     // If 10% threshold has been crossed (or fully assembled), replay stream-ready
     // directly to this viewer so late joiners during an ongoing upload also get the URL.
     if (!isHost && !isChatOnly && rooms[roomId].uploadId) {
