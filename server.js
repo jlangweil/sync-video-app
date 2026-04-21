@@ -332,13 +332,12 @@ io.on('connection', (socket) => {
       const syncState = rooms[roomId].syncState;
       // Only send if it's recent (last 2 minutes)
       if (Date.now() - syncState.timestamp < 120000) {
-        // Only include uploadId if the stream is actually servable (≥10% assembled).
-        // Sending it earlier causes viewers to fetch /stream/:id before it exists → 404.
-        const uid  = rooms[roomId].uploadId;
-        const meta = uid ? uploads[uid] : null;
+        // uploadId intentionally omitted — stream-ready replay (above) handles
+        // the video URL for late joiners. Including it here caused a double-trigger
+        // race where the viewer setup effect ran twice and cleaned up its own listeners.
         socket.emit('fallback-sync-state', {
           ...syncState,
-          uploadId: (meta && meta.streamReadyEmitted) ? uid : null
+          uploadId: null
         });
       }
     }
