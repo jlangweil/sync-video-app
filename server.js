@@ -18,12 +18,26 @@ app.use(cors({
   credentials: true
 }));
 
-// Serve static files in production
+// Serve static files in production.
+// IMPORTANT: the wildcard get('*') must NOT catch API routes.
+// We handle that by calling next() for any path that belongs to the API,
+// so Express continues to the actual route handler registered later in the file.
 if (process.env.NODE_ENV === 'production') {
   app.use(express.static(path.join(__dirname, '../client/build')));
-  
-  app.get('*', (req, res) => {
-    res.sendFile(path.join(__dirname, '../client/build', 'index.html'));
+
+  app.get('*', (req, res, next) => {
+    // Let API routes pass through to their own handlers
+    if (
+      req.path.startsWith('/stream/') ||
+      req.path.startsWith('/upload/') ||
+      req.path === '/health' ||
+      req.path === '/create-room'
+    ) {
+      return next();
+    }
+    res.sendFile(path.join(__dirname, '../client/build', 'index.html'), err => {
+      if (err) next(err);
+    });
   });
 }
 
