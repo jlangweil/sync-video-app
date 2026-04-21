@@ -72,38 +72,141 @@ const chunkStorage = multer.diskStorage({
     cb(null, dir);
   },
   filename: (req, file, cb) => {
-    // chunkIndex comes from URL param to avoid multipart field ordering issues
     const idx = parseInt(req.params.chunkIndex, 10);
     cb(null, `chunk_${String(idx).padStart(6, '0')}`);
   }
 });
 const chunkUpload = multer({ storage: chunkStorage });
 
-// Async chunk assembly — uses streams so the event loop is never blocked
-async function assembleChunks(uploadId, totalChunks, destPath) {
-  const chunkDir = path.join(chunksDir, uploadId);
-  const writeStream = fs.createWriteStream(destPath);
-  for (let i = 0; i < totalChunks; i++) {
-    const chunkPath = path.join(chunkDir, `chunk_${String(i).padStart(6, '0')}`);
-    await new Promise((resolve, reject) => {
-      const rs = fs.createReadStream(chunkPath);
-      rs.pipe(writeStream, { end: false });
-      rs.on('end', resolve);
-      rs.on('error', reject);
-    });
+// ─── Progressive assembly ────────────────────────────────────────────────────
+// Assembles sequential chunks into a growing file as soon as they arrive.
+// Emits stream-ready when 10% is sequentially assembled (viewers can start early).
+// Uses an assembling flag to prevent concurrent assembly races.
+const STREAM_READY_THRESHOLD = 0.10; // emit stream-ready after 10% assembled
+
+async function assembleSequential(uploadId, meta) {
+  if (meta.assembling) return; // another call is already running
+  meta.assembling = true;
+
+  try {
+    const destPath = path.join(uploadsDir, `${uploadId}.${meta.ext}`);
+
+    // Open the write stream the first time
+    if (!meta.writeStream) {
+      meta.writeStream = fs.createWriteStream(destPath);
+    }
+
+    // Drain as many sequential chunks as are available
+    while (meta.pendingChunkSet.has(meta.assembledChunks)) {
+      const idx = meta.assembledChunks;
+      const chunkPath = path.join(chunksDir, uploadId, `chunk_${String(idx).padStart(6, '0')}`);
+
+      await new Promise((resolve, reject) => {
+        const rs = fs.createReadStream(chunkPath);
+        rs.pipe(meta.writeStream, { end: false });
+        rs.on('end', resolve);
+        rs.on('error', reject);
+      });
+
+      await fsp.unlink(chunkPath).catch(() => {});
+      meta.pendingChunkSet.delete(idx);
+      meta.assembledChunks++;
+
+      // Emit stream-ready once the 10% threshold is crossed
+      if (!meta.streamReadyEmitted &&
+          meta.assembledChunks >= Math.ceil(meta.totalChunks * STREAM_READY_THRESHOLD)) {
+        meta.streamReadyEmitted = true;
+        console.log(`stream-ready (${Math.round(meta.assembledChunks / meta.totalChunks * 100)}%) for ${uploadId}`);
+        if (rooms[meta.roomId]) {
+          io.to(meta.roomId).emit('stream-ready', {
+            uploadId,
+            streamUrl: `/stream/${uploadId}`,
+            fileName: meta.fileName,
+            fileType: meta.fileType,
+            fileSize: meta.fileSize
+          });
+        }
+      }
+    }
+
+    // Finalise when every chunk is in
+    if (meta.assembledChunks === meta.totalChunks && !meta.assembled) {
+      meta.assembled = true;
+      await new Promise((resolve, reject) => {
+        meta.writeStream.end();
+        meta.writeStream.on('finish', resolve);
+        meta.writeStream.on('error', reject);
+      });
+      meta.writeStream = null;
+      await fsp.rm(path.join(chunksDir, uploadId), { recursive: true, force: true }).catch(() => {});
+      console.log(`Fully assembled: ${uploadId}`);
+
+      // For tiny files (<10 chunks) that didn't hit the 10% threshold mid-stream
+      if (!meta.streamReadyEmitted && rooms[meta.roomId]) {
+        meta.streamReadyEmitted = true;
+        io.to(meta.roomId).emit('stream-ready', {
+          uploadId, streamUrl: `/stream/${uploadId}`,
+          fileName: meta.fileName, fileType: meta.fileType, fileSize: meta.fileSize
+        });
+      }
+    }
+  } catch (err) {
+    console.error(`assembleSequential error for ${uploadId}:`, err);
+  } finally {
+    meta.assembling = false;
+    // If more chunks arrived while we were running, go again
+    if (meta.pendingChunkSet.has(meta.assembledChunks)) {
+      setImmediate(() => assembleSequential(uploadId, meta));
+    }
   }
-  await new Promise((resolve, reject) => {
-    writeStream.end();
-    writeStream.on('finish', resolve);
-    writeStream.on('error', reject);
-  });
-  await fsp.rm(chunkDir, { recursive: true, force: true }).catch(() => {});
+}
+
+// ─── Serve a growing file (supports partial content while still uploading) ───
+function pipeGrowingFile(filePath, start, end, meta, req, res) {
+  let position = start;
+  let timer = null;
+  let aborted = false;
+
+  req.on('close', () => { aborted = true; if (timer) clearTimeout(timer); });
+
+  function readNext() {
+    if (aborted || res.destroyed) return;
+    if (position > end) { if (!res.destroyed) res.end(); return; }
+
+    let currentSize = 0;
+    try { currentSize = fs.statSync(filePath).size; } catch (_) {}
+
+    if (currentSize > position) {
+      const availableEnd = Math.min(end, currentSize - 1);
+      const rs = fs.createReadStream(filePath, { start: position, end: availableEnd });
+      rs.on('data',  chunk => { if (!res.destroyed) res.write(chunk); });
+      rs.on('error', ()    => { if (!res.destroyed) res.end(); });
+      rs.on('end', () => {
+        position = availableEnd + 1;
+        if (position > end || meta.assembled) {
+          if (!res.destroyed) res.end();
+        } else {
+          timer = setTimeout(readNext, 150);
+        }
+      });
+    } else {
+      if (meta.assembled) { if (!res.destroyed) res.end(); return; }
+      timer = setTimeout(readNext, 150);
+    }
+  }
+
+  readNext();
 }
 
 // Delete an uploaded file and its metadata
 async function deleteUploadedFile(uploadId) {
   const meta = uploads[uploadId];
   if (!meta) return;
+  // Close any open write stream first
+  if (meta.writeStream) {
+    meta.writeStream.destroy();
+    meta.writeStream = null;
+  }
   const filePath = path.join(uploadsDir, `${uploadId}.${meta.ext}`);
   await fsp.unlink(filePath).catch(() => {});
   await fsp.rm(path.join(chunksDir, uploadId), { recursive: true, force: true }).catch(() => {});
@@ -206,7 +309,24 @@ io.on('connection', (socket) => {
       fileType: rooms[roomId].fileType,
       uploadId: rooms[roomId].uploadId || null
     });
-    
+
+    // If file is already assembled, replay stream-ready directly to this viewer
+    // so late joiners get the stream URL without needing fallback-sync-state
+    if (!isHost && !isChatOnly && rooms[roomId].uploadId) {
+      const uid = rooms[roomId].uploadId;
+      const meta = uploads[uid];
+      if (meta && meta.assembled) {
+        console.log(`Replaying stream-ready to late joiner ${socket.id} (uploadId: ${uid})`);
+        socket.emit('stream-ready', {
+          uploadId: uid,
+          streamUrl: `/stream/${uid}`,
+          fileName: meta.fileName,
+          fileType: meta.fileType,
+          fileSize: meta.fileSize
+        });
+      }
+    }
+
     // If room has a recent sync state and this is a viewer, send it (skip for chat-only users)
     if (!isHost && !isChatOnly && rooms[roomId].syncState) {
       const syncState = rooms[roomId].syncState;
@@ -861,79 +981,70 @@ app.post('/upload/init', express.json(), (req, res) => {
   ext = extMap[ext] || ext;
 
   const uploadId = crypto.randomBytes(8).toString('hex');
-  uploads[uploadId] = { roomId, fileName, fileType, fileSize, totalChunks: parseInt(totalChunks, 10), receivedChunks: 0, assembled: false, ext };
+  uploads[uploadId] = {
+    roomId, fileName, fileType,
+    fileSize: parseInt(fileSize, 10) || 0,
+    totalChunks: parseInt(totalChunks, 10),
+    receivedChunks: 0,
+    assembledChunks: 0,       // sequential chunks written to disk so far
+    pendingChunkSet: new Set(), // received but not yet appended (gap in sequence)
+    assembled: false,           // all chunks done
+    streamReadyEmitted: false,  // 10% threshold crossed
+    assembling: false,          // lock: prevents concurrent assembleSequential calls
+    writeStream: null,          // open write stream into growing file
+    ext
+  };
 
   if (rooms[roomId]) rooms[roomId].uploadId = uploadId;
   console.log(`Upload init: ${uploadId} (${fileName}, ${totalChunks} chunks)`);
   res.json({ uploadId });
 });
 
-// POST /upload/chunk/:uploadId/:chunkIndex — upload one chunk (multipart, field name "chunk")
+// POST /upload/chunk/:uploadId/:chunkIndex — upload one chunk (multipart, field "chunk")
 app.post('/upload/chunk/:uploadId/:chunkIndex', (req, res, next) => {
   if (!uploads[req.params.uploadId]) return res.status(404).json({ error: 'Upload not found' });
   next();
-}, chunkUpload.single('chunk'), async (req, res) => {
+}, chunkUpload.single('chunk'), (req, res) => {
   const { uploadId } = req.params;
+  const chunkIndex = parseInt(req.params.chunkIndex, 10);
   const meta = uploads[uploadId];
   meta.receivedChunks++;
+  meta.pendingChunkSet.add(chunkIndex);
   res.json({ received: meta.receivedChunks, total: meta.totalChunks });
-
-  if (meta.receivedChunks === meta.totalChunks && !meta.assembled) {
-    meta.assembled = true;
-    const destPath = path.join(uploadsDir, `${uploadId}.${meta.ext}`);
-    try {
-      await assembleChunks(uploadId, meta.totalChunks, destPath);
-      console.log(`Stream ready: ${uploadId} (${meta.fileName})`);
-      if (rooms[meta.roomId]) {
-        io.to(meta.roomId).emit('stream-ready', {
-          uploadId,
-          streamUrl: `/stream/${uploadId}`,
-          fileName: meta.fileName,
-          fileType: meta.fileType,
-          fileSize: meta.fileSize
-        });
-      }
-    } catch (err) {
-      console.error(`Assembly failed for ${uploadId}:`, err);
-      meta.assembled = false;
-      if (rooms[meta.roomId]) {
-        io.to(meta.roomId).emit('stream-error', { message: 'File assembly failed on server' });
-      }
-    }
-  }
+  // Kick off sequential assembly (non-blocking — response already sent)
+  assembleSequential(uploadId, meta);
 });
 
-// GET /stream/:uploadId — serve video with HTTP Range request support
+// GET /stream/:uploadId — serve video; supports Range requests on a growing file
 app.get('/stream/:uploadId', (req, res) => {
   const meta = uploads[req.params.uploadId];
-  if (!meta) return res.status(404).json({ error: 'File not found' });
-  const filePath = path.join(uploadsDir, `${req.params.uploadId}.${meta.ext}`);
-  if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'File not on disk' });
+  if (!meta || !meta.streamReadyEmitted) return res.status(404).json({ error: 'File not ready yet' });
 
-  const fileSize = fs.statSync(filePath).size;
+  const filePath = path.join(uploadsDir, `${req.params.uploadId}.${meta.ext}`);
+  const totalSize = meta.fileSize;           // declared total — stays constant
   const contentType = meta.fileType || 'video/mp4';
   const range = req.headers.range;
 
   if (range) {
     const [startStr, endStr] = range.replace(/bytes=/, '').split('-');
     const start = parseInt(startStr, 10);
-    const end = endStr ? parseInt(endStr, 10) : fileSize - 1;
+    const end   = endStr ? Math.min(parseInt(endStr, 10), totalSize - 1) : totalSize - 1;
     res.writeHead(206, {
-      'Content-Range': `bytes ${start}-${end}/${fileSize}`,
-      'Accept-Ranges': 'bytes',
+      'Content-Range':  `bytes ${start}-${end}/${totalSize}`,
+      'Accept-Ranges':  'bytes',
       'Content-Length': end - start + 1,
-      'Content-Type': contentType,
-      'Cache-Control': 'no-cache'
+      'Content-Type':   contentType,
+      'Cache-Control':  'no-cache'
     });
-    fs.createReadStream(filePath, { start, end }).pipe(res);
+    pipeGrowingFile(filePath, start, end, meta, req, res);
   } else {
     res.writeHead(200, {
-      'Content-Length': fileSize,
-      'Content-Type': contentType,
-      'Accept-Ranges': 'bytes',
-      'Cache-Control': 'no-cache'
+      'Content-Length': totalSize,
+      'Content-Type':   contentType,
+      'Accept-Ranges':  'bytes',
+      'Cache-Control':  'no-cache'
     });
-    fs.createReadStream(filePath).pipe(res);
+    pipeGrowingFile(filePath, 0, totalSize - 1, meta, req, res);
   }
 });
 
