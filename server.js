@@ -126,6 +126,15 @@ async function assembleSequential(uploadId, meta) {
       meta.pendingChunkSet.delete(idx);
       meta.assembledChunks++;
 
+      // Emit buffering progress to viewers while building toward the start threshold.
+      // 1% of the total file assembled = 10% of the required buffer on the client side
+      // (since stream-ready fires at 10%). We emit on every chunk so the bar is smooth.
+      if (!meta.streamReadyEmitted && rooms[meta.roomId]) {
+        const thresholdChunks = Math.ceil(meta.totalChunks * STREAM_READY_THRESHOLD);
+        const pct = Math.min(99, Math.round((meta.assembledChunks / thresholdChunks) * 100));
+        io.to(meta.roomId).emit('stream-buffering', { progress: pct });
+      }
+
       // Emit stream-ready once the 10% threshold is crossed
       if (!meta.streamReadyEmitted &&
           meta.assembledChunks >= Math.ceil(meta.totalChunks * STREAM_READY_THRESHOLD)) {
