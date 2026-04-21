@@ -310,13 +310,13 @@ io.on('connection', (socket) => {
       uploadId: rooms[roomId].uploadId || null
     });
 
-    // If file is already assembled, replay stream-ready directly to this viewer
-    // so late joiners get the stream URL without needing fallback-sync-state
+    // If 10% threshold has been crossed (or fully assembled), replay stream-ready
+    // directly to this viewer so late joiners during an ongoing upload also get the URL.
     if (!isHost && !isChatOnly && rooms[roomId].uploadId) {
       const uid = rooms[roomId].uploadId;
       const meta = uploads[uid];
-      if (meta && meta.assembled) {
-        console.log(`Replaying stream-ready to late joiner ${socket.id} (uploadId: ${uid})`);
+      if (meta && meta.streamReadyEmitted) {
+        console.log(`Replaying stream-ready to late joiner ${socket.id} (uploadId: ${uid}, assembled: ${meta.assembled})`);
         socket.emit('stream-ready', {
           uploadId: uid,
           streamUrl: `/stream/${uid}`,
