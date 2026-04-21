@@ -332,9 +332,13 @@ io.on('connection', (socket) => {
       const syncState = rooms[roomId].syncState;
       // Only send if it's recent (last 2 minutes)
       if (Date.now() - syncState.timestamp < 120000) {
+        // Only include uploadId if the stream is actually servable (≥10% assembled).
+        // Sending it earlier causes viewers to fetch /stream/:id before it exists → 404.
+        const uid  = rooms[roomId].uploadId;
+        const meta = uid ? uploads[uid] : null;
         socket.emit('fallback-sync-state', {
           ...syncState,
-          uploadId: rooms[roomId].uploadId || null
+          uploadId: (meta && meta.streamReadyEmitted) ? uid : null
         });
       }
     }
