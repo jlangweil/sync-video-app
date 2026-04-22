@@ -97,6 +97,7 @@ const chunkUpload = multer({ storage: chunkStorage });
 // Emits stream-ready when 10% is sequentially assembled (viewers can start early).
 // Uses an assembling flag to prevent concurrent assembly races.
 const STREAM_READY_THRESHOLD = 0.10; // emit stream-ready after 10% assembled
+const CHUNK_SIZE = 5 * 1024 * 1024;  // must match client CHUNK_SIZE in WebRTCProvider.jsx
 
 async function assembleSequential(uploadId, meta) {
   if (meta.assembling) return; // another call is already running
@@ -148,6 +149,16 @@ async function assembleSequential(uploadId, meta) {
             fileType: meta.fileType,
             fileSize: meta.fileSize
           });
+        }
+      }
+
+      // If a host seek landed in unassembled territory, ungate playback once we reach it
+      if (rooms[meta.roomId]?.pendingSeekByte) {
+        const assembledBytes = meta.assembledChunks * CHUNK_SIZE;
+        if (assembledBytes >= rooms[meta.roomId].pendingSeekByte) {
+          console.log(`[seek-buffered] assembly reached seek position (${assembledBytes} bytes)`);
+          rooms[meta.roomId].pendingSeekByte = null;
+          io.to(meta.roomId).emit('seek-buffered');
         }
       }
     }
@@ -202,8 +213,7 @@ function pipeGrowingFile(filePath, start, end, meta, req, res) {
     if (currentSize > position) {
       const availableEnd = Math.min(end, currentSize - 1);
       const rs = fs.createReadStream(filePath, { start: position, end: availableEnd });
-      rs.on('data',  chunk => { if (!res.destroyed) res.write(chunk); });
-      rs.on('error', ()    => { if (!res.destroyed) res.end(); });
+      rs.on('error', () => { if (!res.destroyed) res.end(); });
       rs.on('end', () => {
         position = availableEnd + 1;
         if (position > end || meta.assembled) {
@@ -212,6 +222,10 @@ function pipeGrowingFile(filePath, start, end, meta, req, res) {
           timer = setTimeout(readNext, 150);
         }
       });
+      // pipe() handles backpressure automatically: if the client socket buffer is
+      // full, the read stream pauses until it drains. Without this, res.write()
+      // queues unbounded data in memory and the process OOMs under load.
+      rs.pipe(res, { end: false });
     } else {
       if (meta.assembled) { if (!res.destroyed) res.end(); return; }
       timer = setTimeout(readNext, 150);
@@ -274,7 +288,8 @@ io.on('connection', (socket) => {
         fileName: null,
         fileType: null,
         lastActive: Date.now(),
-        syncState: null // For backup state tracking
+        syncState: null,       // For backup state tracking
+        pendingSeekByte: null  // Set when host seeks beyond assembled area; cleared on seek-buffered
       };
     }
     
@@ -489,14 +504,14 @@ io.on('connection', (socket) => {
   
   // Enhanced seek operation handler
   socket.on('videoSeekOperation', (data) => {
-    const { roomId, seekTime, isPlaying, sourceTimestamp } = data;
-    
+    const { roomId, seekTime, videoDuration, isPlaying, sourceTimestamp } = data;
+
     console.log(`[${socket.id}] Sending SEEK to ${seekTime.toFixed(2)} in room ${roomId}`);
-    
+
     // Calculate server processing latency
     const serverTimestamp = Date.now();
     const latency = sourceTimestamp ? serverTimestamp - sourceTimestamp : 0;
-    
+
     // Store sync state for reconnection purposes
     if (rooms[roomId]) {
       rooms[roomId].syncState = {
@@ -506,12 +521,30 @@ io.on('connection', (socket) => {
         hostId: socket.id,
         seekOperation: true
       };
-      
+
+      // Check whether the seek position is already assembled on the server.
+      // If not, tell the host to pause and wait; emit seek-buffered once assembly catches up.
+      const uid = rooms[roomId].uploadId;
+      const meta = uid && uploads[uid];
+      if (meta && videoDuration && meta.fileSize) {
+        const seekByte     = Math.floor(seekTime / videoDuration * meta.fileSize);
+        const assembledBytes = meta.assembledChunks * CHUNK_SIZE;
+        if (seekByte > assembledBytes && !meta.assembled) {
+          // Seek is beyond assembled area — host must wait for assembly to catch up
+          rooms[roomId].pendingSeekByte = seekByte;
+          socket.emit('seek-needs-buffering'); // only to host
+          console.log(`[seek] position ${seekTime.toFixed(1)}s (byte ${seekByte}) beyond assembled ${assembledBytes} — rebuffering`);
+        } else {
+          // Already assembled — clear any pending seek gate
+          rooms[roomId].pendingSeekByte = null;
+        }
+      }
+
       // Get non-chat-only users
-      const regularViewers = rooms[roomId].users.filter(user => 
+      const regularViewers = rooms[roomId].users.filter(user =>
         user.id !== socket.id && !user.isChatOnly
       );
-      
+
       // Emit to each regular viewer
       regularViewers.forEach(viewer => {
         io.to(viewer.id).emit('videoSeekOperation', {
@@ -836,34 +869,43 @@ io.on('connection', (socket) => {
             if (currentUser && currentUser.active === false) {
               // Remove user after timeout
               rooms[roomId].users = rooms[roomId].users.filter(u => u.id !== socket.id);
-              
-              // If room is empty, remove it
+
+              // If room is empty, clean up everything
               if (rooms[roomId].users.length === 0) {
+                const uid = rooms[roomId].uploadId;
+                if (uid) deleteUploadedFile(uid).catch(() => {});
                 delete rooms[roomId];
-                console.log(`Room ${roomId} deleted (empty)`);
+                console.log(`Room ${roomId} deleted (empty) — upload ${uid || 'none'} cleaned up`);
               } else {
-                // If host left and hasn't reconnected, update room state
+                // If host left and hasn't reconnected, tear down the stream
                 if (wasHost && rooms[roomId].host === socket.id) {
                   rooms[roomId].host = null;
-                  // Don't delete the uploaded file here — the host may reconnect
-                  // and viewers may still be downloading. File is cleaned up when
-                  // the host explicitly stops streaming or the room expires.
-                  console.log(`Host left room ${roomId} after grace period`);
+                  const uid = rooms[roomId].uploadId;
+                  if (uid) {
+                    deleteUploadedFile(uid).catch(() => {});
+                    rooms[roomId].uploadId = null;
+                    rooms[roomId].streaming = false;
+                    // Notify remaining viewers that the stream ended
+                    io.to(roomId).emit('streaming-status', { isStreaming: false, fileName: null, fileType: null, uploadId: null });
+                  }
+                  console.log(`Host left room ${roomId} — stream cleaned up`);
                 }
-                
+
                 // Notify remaining users that this user left
                 io.to(roomId).emit('userLeft', {
                   username,
                   users: rooms[roomId].users.filter(u => u.active !== false)
                 });
-                
+
                 console.log(`User ${username} removed from room ${roomId} after timeout`);
               }
             }
           }
-          
-          // Clean up connection health
+
+          // Clean up all per-socket maps
           delete connectionHealth[socket.id];
+          delete userSocketMap[socket.id];
+          delete peerIdMap[socket.id];
         }, 30000); // 30 second grace period for reconnection
       }
       
@@ -969,8 +1011,9 @@ setInterval(() => {
       return true;
     });
     
-    // If room is empty or inactive for 30 minutes, remove it
+    // If room is empty or inactive for 30 minutes, remove it and its upload
     if (room.users.length === 0 || now - room.lastActive > 1800000) {
+      if (room.uploadId) deleteUploadedFile(room.uploadId).catch(() => {});
       delete rooms[roomId];
       console.log(`Removed inactive room ${roomId}`);
     }
